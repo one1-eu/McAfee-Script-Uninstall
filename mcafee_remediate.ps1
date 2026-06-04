@@ -176,13 +176,15 @@ function Set-RebootAtMidnight {
 function Set-RebootMarker {
     param(
         [string]$MarkerPath,
-        [string]$Reason
+        [string]$Reason,
+        [int]$RebootCount = 1
     )
 
     try {
         $payload = [pscustomobject]@{
-            CreatedUtc = (Get-Date).ToUniversalTime().ToString("o")
-            Reason     = $Reason
+            CreatedUtc  = (Get-Date).ToUniversalTime().ToString("o")
+            Reason      = $Reason
+            RebootCount = $RebootCount
         } | ConvertTo-Json -Compress
 
         Set-Content -Path $MarkerPath -Value $payload -Encoding Ascii -Force
@@ -344,6 +346,7 @@ else {
 
 # If we previously scheduled a reboot (marker file), do not keep attempting cleanup before the reboot happens.
 $marker = Get-RebootMarker -Path $RebootMarkerPath
+$RebootCount = if ($marker -and $marker.RebootCount) { [int]$marker.RebootCount } else { 0 }
 if ($marker -and $marker.CreatedUtc) {
     $markerUtc = $null
     try { $markerUtc = [datetime]::Parse($marker.CreatedUtc).ToUniversalTime() } catch {}
@@ -378,9 +381,13 @@ switch ($status.State) {
     }
     2 {
         Write-Log "Pre-check: Residual McAfee files detected (≤10 files with QcShm.exe running); a reboot is required to clear file locks." "INFO"
+        if ($RebootCount -ge 3) {
+            Write-Log ("Reboot limit (3) reached after {0} attempts. Exiting with 1 to surface failure." -f $RebootCount) "ERROR"
+            exit 1
+        }
         Set-RebootAtMidnight
-    Register-PostRebootTask -WorkingFolder $DebloatFolder
-        Set-RebootMarker -MarkerPath $RebootMarkerPath -Reason "ResidualState"
+        Register-PostRebootTask -WorkingFolder $DebloatFolder
+        Set-RebootMarker -MarkerPath $RebootMarkerPath -Reason "ResidualState" -RebootCount ($RebootCount + 1)
         exit 0
     }
     1 {
@@ -419,8 +426,17 @@ function Get-LocalFileIfMissing {
     }
 }
 
-Get-LocalFileIfMissing -Url $McAfeeCleanZipUrl -LocalPath $McAfeeCleanZipPath -Description "mcafeeclean.zip"
-Get-LocalFileIfMissing -Url $McCleanupZipUrl   -LocalPath $McCleanupZipPath   -Description "mccleanup.zip"
+$downloadAttempts = 3
+$downloadDelay    = 15
+for ($i = 1; $i -le $downloadAttempts; $i++) {
+    Get-LocalFileIfMissing -Url $McAfeeCleanZipUrl -LocalPath $McAfeeCleanZipPath -Description "mcafeeclean.zip"
+    Get-LocalFileIfMissing -Url $McCleanupZipUrl   -LocalPath $McCleanupZipPath   -Description "mccleanup.zip"
+    if ((Test-Path $McAfeeCleanZipPath) -and (Test-Path $McCleanupZipPath)) { break }
+    if ($i -lt $downloadAttempts) {
+        Write-Log ("Download attempt {0} incomplete; waiting {1}s for network to become ready..." -f $i, $downloadDelay) "WARNING"
+        Start-Sleep -Seconds $downloadDelay
+    }
+}
 
 ### Run Cleanup Tools ###
 function Start-McAfeeCleanupTool {
@@ -459,6 +475,14 @@ function Start-McAfeeCleanupTool {
 
 $ExtractFolder1 = Join-Path $DebloatFolder "mcafeeclean_extracted"
 $ExtractFolder2 = Join-Path $DebloatFolder "mccleanup_extracted"
+
+### Stop McAfee kernel drivers before running cleanup tools ###
+Write-Log "Attempting to stop/disable McAfee kernel drivers before cleanup..." "INFO"
+foreach ($drv in @("mfesec", "mfeelam")) {
+    [void](Invoke-ProcessQuiet -FilePath "sc.exe" -ArgumentList @("config", $drv, "start=", "disabled") -Description ("Disable driver {0}" -f $drv))
+    [void](Invoke-ProcessQuiet -FilePath "sc.exe" -ArgumentList @("stop", $drv) -Description ("Stop driver {0}" -f $drv))
+    Write-Log ("Attempted to disable/stop driver: {0}" -f $drv) "INFO"
+}
 
 Start-McAfeeCleanupTool -ZipPath $McAfeeCleanZipPath -ExtractFolder $ExtractFolder1 -ToolName "mcafeeclean"
 Start-McAfeeCleanupTool -ZipPath $McCleanupZipPath   -ExtractFolder $ExtractFolder2 -ToolName "mccleanup"
@@ -599,18 +623,13 @@ foreach ($dir in $mcAfeeDirs) {
     }
 }
 
-### Remove Temporary Folders & ZIP Files ###
-Write-Log "Removing temporary folders and ZIP files..." "INFO"
+### Remove Temporary Extraction Folders ###
+# ZIPs are intentionally kept so the post-reboot pass can use them without needing a network connection.
+Write-Log "Removing temporary extraction folders..." "INFO"
 foreach ($fld in @($ExtractFolder1, $ExtractFolder2)) {
     if (Test-Path $fld) {
         Remove-Item $fld -Recurse -Force -ErrorAction SilentlyContinue
         Write-Log ("Removed temporary folder: {0}" -f $fld) "DEBUG"
-    }
-}
-foreach ($zipFile in @($McAfeeCleanZipPath, $McCleanupZipPath)) {
-    if (Test-Path $zipFile) {
-        Remove-Item $zipFile -Force -ErrorAction SilentlyContinue
-        Write-Log ("Removed ZIP file: {0}" -f $zipFile) "DEBUG"
     }
 }
 
@@ -631,18 +650,26 @@ switch ($status.State) {
     }
     2 {
         Write-Log "Final detection: Residual McAfee files remain (≤10 files with QcShm.exe running). A reboot is required to clear file locks." "INFO"
+        if ($RebootCount -ge 3) {
+            Write-Log ("Reboot limit (3) reached after {0} attempts. Exiting with 1 to surface failure." -f $RebootCount) "ERROR"
+            exit 1
+        }
         Set-RebootAtMidnight
         Register-PostRebootTask -WorkingFolder $DebloatFolder
-        Set-RebootMarker -MarkerPath $RebootMarkerPath -Reason "ResidualStateFinal"
+        Set-RebootMarker -MarkerPath $RebootMarkerPath -Reason "ResidualStateFinal" -RebootCount ($RebootCount + 1)
         exit 0
     }
     1 {
         # If registry traces are gone but files remain and lock indicators exist, treat as reboot-required.
         if (-not $status.FoundRegistry -and $status.TotalFiles -gt 0 -and $lockIndicators.Count -gt 0) {
+            if ($RebootCount -ge 3) {
+                Write-Log ("Reboot limit (3) reached after {0} attempts with lock indicators: {1}. Exiting with 1 to surface failure." -f $RebootCount, ($lockIndicators -join ",")) "ERROR"
+                exit 1
+            }
             Write-Log "Final detection: McAfee remnants still detected, but file locks are likely preventing cleanup. Scheduling reboot and deferring failure." "WARNING"
             Set-RebootAtMidnight
             Register-PostRebootTask -WorkingFolder $DebloatFolder
-            Set-RebootMarker -MarkerPath $RebootMarkerPath -Reason ("FileLocks:" + ($lockIndicators -join ","))
+            Set-RebootMarker -MarkerPath $RebootMarkerPath -Reason ("FileLocks:" + ($lockIndicators -join ",")) -RebootCount ($RebootCount + 1)
             exit 0
         }
 
