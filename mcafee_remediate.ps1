@@ -397,8 +397,8 @@ switch ($status.State) {
 
 ### URLs ###
 # Note: ServiceUI is no longer used.
-$McAfeeCleanZipUrl  = "https://github.com/nullifyac/McAfee_Removal/raw/refs/heads/main/mcafeeclean.zip"
-$McCleanupZipUrl    = "https://github.com/nullifyac/McAfee_Removal/raw/refs/heads/main/mccleanup.zip"
+$McAfeeCleanZipUrl  = "https://github.com/one1-eu/McAfee-Script-Uninstall/raw/refs/heads/main/mcafeeclean.zip"
+$McCleanupZipUrl    = "https://github.com/one1-eu/McAfee-Script-Uninstall/raw/refs/heads/main/mccleanup.zip"
 
 # Local file paths
 $McAfeeCleanZipPath = Join-Path $DebloatFolder "mcafeeclean.zip"
